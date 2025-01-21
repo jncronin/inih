@@ -25,7 +25,7 @@ extern "C" {
 
 /* Typedef for prototype of handler function. */
 typedef int (*ini_handler)(void *user, const char *section, const char *name,
-                           const char *value);
+                           const char *value, int section_lineno, int key_lineno);
 
 /* Typedef for prototype of fgets-style reader function. */
 typedef char *(*ini_reader)(char *str, int num, void *stream);
@@ -179,6 +179,8 @@ inline int ini_parse_stream(ini_reader reader, void *stream,
   char *value;
   int lineno = 0;
   int error = 0;
+  int section_line = 0;
+  int key_line = 0;
 
 #if !INI_USE_STACK
   line = (char *)malloc(INI_MAX_LINE);
@@ -216,7 +218,7 @@ inline int ini_parse_stream(ini_reader reader, void *stream,
 
       /* Non-blank line with leading whitespace, treat as continuation
          of previous name's value (as per Python configparser). */
-      if (!handler(user, section, prev_name, start) && !error)
+      if (!handler(user, section, prev_name, start, section_line, key_line) && !error)
         error = lineno;
     }
 #endif
@@ -226,6 +228,7 @@ inline int ini_parse_stream(ini_reader reader, void *stream,
       if (*end == ']') {
         *end = '\0';
         strncpy0(section, start + 1, sizeof(section));
+        section_line = lineno;
         *prev_name = '\0';
       } else if (!error) {
         /* No ']' found on section line */
@@ -237,6 +240,7 @@ inline int ini_parse_stream(ini_reader reader, void *stream,
       if (*end == '=' || *end == ':') {
         *end = '\0';
         name = rstrip(start);
+        key_line = lineno;
         value = lskip(end + 1);
 #if INI_ALLOW_INLINE_COMMENTS
         end = find_chars_or_comment(value, NULL);
@@ -247,7 +251,7 @@ inline int ini_parse_stream(ini_reader reader, void *stream,
 
         /* Valid name[=:]value pair found, call handler */
         strncpy0(prev_name, name, sizeof(prev_name));
-        if (!handler(user, section, name, value) && !error)
+        if (!handler(user, section, name, value, section_line, key_line) && !error)
           error = lineno;
       } else if (!error) {
         /* No '=' or ':' found on name[=:]value line */
@@ -302,6 +306,12 @@ public:
   // Empty Constructor
   INIReader() {};
 
+  struct unique_str
+  {
+    std::string name;
+    int lineno;
+  };
+
   // Construct INIReader and parse given filename. See ini.h for more info
   // about the parsing.
   explicit INIReader(const std::string &filename);
@@ -310,16 +320,26 @@ public:
   // about the parsing.
   explicit INIReader(FILE *file);
 
+  // Added for GK:
+  // Construct INIReader using stream interface
+  explicit INIReader(ini_reader reader, void *stream);
+
   // Return the result of ini_parse(), i.e., 0 on success, line number of
   // first error on parse error, or -1 on file open error.
   int ParseError() const;
 
   // Return the list of sections found in ini file
   const std::set<std::string> &Sections() const;
+  const std::set<int> &SectionLinenums() const;
+  const std::set<int> &KeyLinenums(int sectionline) const;
 
   // Get a string value from INI file, returning default_value if not found.
   std::string Get(const std::string &section, const std::string &name,
                   const std::string &default_value) const;
+
+  const std::string &Get(int keyline) const;
+  const std::string &GetKey(int keyline) const;
+  const std::string &GetSection(int sectionline) const;
 
   // Get an integer (long) value from INI file, returning default_value if
   // not found or not a valid integer (decimal "1234", "-1234", or hex "0x4d2").
@@ -349,10 +369,16 @@ protected:
   int _error;
   std::map<std::string, std::string> _values;
   std::set<std::string> _sections;
+  std::set<int> _sectionlinenos;
+  std::map<int, std::set<int>> _sectionkeys;
+  std::map<int, std::string> _sectionkeynames;
+  std::map<int, std::string> _ivalues;
+  std::set<int> _emptyset;
+
   static std::string MakeKey(const std::string &section,
                              const std::string &name);
   static int ValueHandler(void *user, const char *section, const char *name,
-                          const char *value);
+                          const char *value, int sectionline, int keyline);
 };
 
 #endif // __INIREADER_H__
@@ -370,6 +396,10 @@ inline INIReader::INIReader(const std::string &filename) {
 
 inline INIReader::INIReader(FILE *file) {
   _error = ini_parse_file(file, ValueHandler, this);
+}
+
+inline INIReader::INIReader(ini_reader reader, void *stream) {
+  _error = ini_parse_stream(reader, stream, ValueHandler, this);
 }
 
 inline int INIReader::ParseError() const { return _error; }
@@ -440,14 +470,54 @@ inline std::string INIReader::MakeKey(const std::string &section,
 }
 
 inline int INIReader::ValueHandler(void *user, const char *section,
-                                   const char *name, const char *value) {
+                                   const char *name, const char *value,
+                                   int section_line, int key_line) {
   INIReader *reader = (INIReader *)user;
   std::string key = MakeKey(section, name);
   if (reader->_values[key].size() > 0)
     reader->_values[key] += "\n";
   reader->_values[key] += value;
   reader->_sections.insert(section);
+  reader->_sectionlinenos.insert(section_line);
+  if(reader->_sectionkeys.find(section_line) == reader->_sectionkeys.end())
+    reader->_sectionkeys[section_line] = std::set<int>();
+  reader->_sectionkeys[section_line].insert(key_line);
+  reader->_sectionkeynames[section_line] = std::string(section);
+  reader->_sectionkeynames[key_line] = std::string(name);
+  reader->_ivalues[key_line] = std::string(value);
+
   return 1;
+}
+
+inline const std::set<int> &INIReader::SectionLinenums() const {
+  return _sectionlinenos;
+}
+
+inline const std::set<int> &INIReader::KeyLinenums(int section) const {
+  auto iter = _sectionkeys.find(section);
+  if(iter == _sectionkeys.end())
+  {
+    return _emptyset;
+  }
+  return iter->second;
+}
+
+inline const std::string &INIReader::Get(int keyline) const
+{
+  auto iter = _ivalues.find(keyline);
+  return iter->second;
+}
+
+inline const std::string &INIReader::GetSection(int sectionline) const
+{
+  auto iter = _sectionkeynames.find(sectionline);
+  return iter->second;
+}
+
+inline const std::string &INIReader::GetKey(int keyline) const
+{
+  auto iter = _sectionkeynames.find(keyline);
+  return iter->second;
 }
 
 #endif // __INIREADER__
